@@ -15,7 +15,7 @@ PAGE_LIMIT = 30
 DOWNLOAD_DIR = 'pages'
 REPEAT_INTERVAL = 5
 
-DRY_RUN = False
+DRY_RUN = True
 
 REQUEST_TIMEOUT = 30
 
@@ -39,57 +39,51 @@ async def fetch_page(session, link, params=None):
 
 
 async def save_page(filepath, content):
-    if DRY_RUN:
-        return
-    else:
-        logging.debug('Save file %s' % filepath)
+    if not DRY_RUN:
         async with aiofiles.open(filepath, mode='w') as fw:
             await fw.write(content)
             await fw.close()
 
 
-async def download_comment_link(session, uid, link):
+async def download_comment_link(session, link, dst_dir):
     comment_link_content = await fetch_page(session, link)
-
-    save_to_dir = os.path.join(DOWNLOAD_DIR, uid, 'links')
-    if not os.path.exists(save_to_dir):
-        os.mkdir(save_to_dir)
+    if not comment_link_content:
+        return link, None
 
     t = str(int(1000 * time.time()))
-    filepath = os.path.join(save_to_dir, 'comment-%s.html' % t)
+    filepath = os.path.join(dst_dir, 'link-%s.html' % t)
     await save_page(filepath, comment_link_content)
-
-    return uid, link
-
-
-async def download_comments_links(session, uid, links):
-    tasks = []
-    for link in links:
-        task = asyncio.create_task(download_comment_link(session, uid, link))
-        tasks.append(task)
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    logging.debug('comments results %s' % str(results))
+    return link, filepath
 
 
 async def download_page(session, uid, link, dst_dir):
-    logging.info('[uid = %s] Download page %s' % (uid, link))
+    logging.debug('[uid = %s] Download page %s' % (uid, link))
     page_content = await fetch_page(session, link)
     if not page_content:
         return uid, None
 
-    logging.info('[uid = %s] Save page %s' % (uid, link))
+    logging.debug('[uid = %s] Save page %s' % (uid, link))
     save_to_dir = os.path.join(dst_dir, uid)
     if not os.path.exists(save_to_dir):
         os.mkdir(save_to_dir)
     filepath = os.path.join(save_to_dir, '%s.html' % uid)
     await save_page(filepath, page_content)
 
-    logging.info('[uid = %s] Download page comments' % uid)
+    logging.debug('[uid = %s] Download page comments' % uid)
     comments_page = await fetch_page(session, COMMENT_PAGE_URL, params={'id': uid})
     comments_links = parse_comments(comments_page)
 
-    # logging.info('[uid = %s] Save comments links on disk' % uid)
-    # await download_comments_links(session, uid, comments_links)
+    if comments_links:
+        links_dir = os.path.join(save_to_dir, 'links')
+        if not os.path.exists(links_dir):
+            os.mkdir(links_dir)
+
+        tasks = []
+        for link in comments_links:
+            task = asyncio.create_task(download_comment_link(session, link, dst_dir=links_dir))
+            tasks.append(task)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        logging.debug('comments results %s' % str(results))
 
     return uid, filepath
 
@@ -99,13 +93,13 @@ async def main():
     # todo wtf Request.raise_for_status ?
 
     # todo ? do we need use one session instead many?
-    # todo argparse or optparse. What diff ?
+    # todo argparse or optparse.
     # todo make file extension by content-type
 
     # todo wrap response in Response class OR return original response
     # todo ? do we need use class based code instead functional ?
     logging.info('Run script')
-    limit = 1
+    limit = 5
     visited = set()
     async with aiohttp.ClientSession() as session:
         while True:
@@ -128,8 +122,10 @@ async def main():
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for uid, _ in results:
                 visited.add(uid)
+            logging.info('Total visited pages %s' % len(visited))
 
             await asyncio.sleep(REPEAT_INTERVAL)
+
             if limit < PAGE_LIMIT:
                 limit += 1
 
@@ -139,7 +135,7 @@ if __name__ == '__main__':
         format='[%(asctime)s] %(levelname).1s %(message)s',
         datefmt='%Y.%m.%d %H:%M:%S',
         filename=None,
-        level=logging.INFO
+        level=logging.DEBUG
     )
     if not os.path.exists(DOWNLOAD_DIR):
         os.mkdir(DOWNLOAD_DIR)
