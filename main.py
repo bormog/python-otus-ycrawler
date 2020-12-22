@@ -27,15 +27,18 @@ async def fetch_page(session, link, params=None):
         async with session.get(link, params=params,
                                timeout=REQUEST_TIMEOUT,
                                allow_redirects=True,
-                               max_redirects=10) as response:
+                               max_redirects=10,
+                               raise_for_status=True) as response:
             # todo fix UnicodeDecodeError if pdf file is fetched
             # example: https://www.cs.tufts.edu/~nr/cs257/archive/alfred-spector/spector85cirrus.pdf
             try:
                 return await response.text()
             except Exception as e:
                 logging.exception('Unknown exception while fetching link %s' % link)
-    except asyncio.TimeoutError as e:
+    except asyncio.TimeoutError:
         logging.exception('Timeout while fetching link %s' % link)
+    except aiohttp.ClientResponseError as e:
+        logging.error('ClientResponseError with status %s' % str(e))
 
 
 async def save_page(filepath, content):
@@ -50,14 +53,14 @@ async def download_comment_link(session, link, dst_dir):
     if not comment_link_content:
         return link, None
 
-    t = str(int(1000 * time.time()))
-    filepath = os.path.join(dst_dir, 'link-%s.html' % t)
+    filename = str(int(1000 * time.time()))
+    filepath = os.path.join(dst_dir, '%s.html' % filename)
     await save_page(filepath, comment_link_content)
     return link, filepath
 
 
 async def download_page(session, uid, link, dst_dir):
-    logging.debug('[uid = %s] Download page %s' % (uid, link))
+    logging.info('[uid = %s] Download page %s' % (uid, link))
     page_content = await fetch_page(session, link)
     if not page_content:
         return uid, None
@@ -120,8 +123,12 @@ async def main():
             logging.info('Found %s new pages' % len(tasks))
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            for uid, _ in results:
-                visited.add(uid)
+            # todo check if not error in results
+            for result in results:
+                if isinstance(result, Exception):
+                    logging.exception('Some exception: %s' % str(result))
+                else:
+                    visited.add(uid)
             logging.info('Total visited pages %s' % len(visited))
 
             await asyncio.sleep(REPEAT_INTERVAL)
@@ -135,7 +142,7 @@ if __name__ == '__main__':
         format='[%(asctime)s] %(levelname).1s %(message)s',
         datefmt='%Y.%m.%d %H:%M:%S',
         filename=None,
-        level=logging.DEBUG
+        level=logging.INFO
     )
     if not os.path.exists(DOWNLOAD_DIR):
         os.mkdir(DOWNLOAD_DIR)
