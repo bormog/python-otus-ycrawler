@@ -55,13 +55,14 @@ async def fetch_page(session, link, params=None):
                 logging.exception('Unknown exception while fetching link %s' % link)
 
     except asyncio.TimeoutError:
-        logging.exception('Timeout while fetching link %s' % link)
+        logging.info('Timeout while fetching link %s and params %s' % (link, params))
     except aiohttp.InvalidURL:
         logging.exception('Invalid url %s with params %s' % (link, params))
     except aiohttp.ClientResponseError as e:
-        logging.exception('ClientResponseError with status %s' % str(e))
+        logging.error('ClientResponseError with status %s, message %s, link %s and params %s' % (
+        e.status, e.message, link, params))
     except aiohttp.ClientOSError as e:
-        logging.exception('ClientOSError %s' % str(e))
+        logging.exception('ClientOSError: %s' % str(e))
 
     return FetchResult(link=link, params=params, status=None, encoding=None, ext=None, content=None)
 
