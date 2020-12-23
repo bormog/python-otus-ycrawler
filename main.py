@@ -18,6 +18,9 @@ COMMENT_PAGE_URL = 'https://news.ycombinator.com/item'
 ALLOWED_FILE_CONTENT_TYPES = ['application/pdf', 'image/png']
 REQUEST_TIMEOUT = 30
 
+INITIAL_LIMIT = 3
+INITIAL_INTERVAL = 2
+
 PAGE_LIMIT = 30
 REPEAT_INTERVAL = 15
 DRY_RUN = False
@@ -119,7 +122,7 @@ async def process_page(session, uid, link, save_to_dir, dry_run=False):
 async def main(page_limit, repeat_interval, download_dir, dry_run):
     logging.info('Run script')
     visited = set()
-    limit = 3
+    limit = INITIAL_LIMIT
     async with aiohttp.ClientSession() as session:
         while True:
             logging.info('Start fetch main page')
@@ -150,15 +153,13 @@ async def main(page_limit, repeat_interval, download_dir, dry_run):
 
             # Slowly increase limit and sleep to avoid zerg rush
             if limit < page_limit:
-                limit += 3
-                sleep = 3
+                limit += INITIAL_LIMIT
+                sleep = INITIAL_INTERVAL
             elif limit != page_limit:
                 limit = page_limit
                 sleep = repeat_interval
 
             await asyncio.sleep(sleep)
-
-            # await asyncio.sleep(repeat_interval)
 
 
 if __name__ == '__main__':
