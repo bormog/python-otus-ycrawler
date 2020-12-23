@@ -9,6 +9,7 @@ from mimetypes import guess_extension
 
 import aiofiles
 import aiohttp
+import async_timeout
 
 from parsers import parse_top_news, parse_comments
 
@@ -118,6 +119,7 @@ async def process_page(session, uid, link, save_to_dir, dry_run=False):
 async def main(page_limit, repeat_interval, download_dir, dry_run):
     logging.info('Run script')
     visited = set()
+    limit = 3
     async with aiohttp.ClientSession() as session:
         while True:
             logging.info('Start fetch main page')
@@ -126,7 +128,7 @@ async def main(page_limit, repeat_interval, download_dir, dry_run):
                 logging.error('Main content is empty. Continue')
                 continue
 
-            top_news = parse_top_news(fetch_result.content, limit=page_limit)
+            top_news = parse_top_news(fetch_result.content, limit=limit)
             tasks = []
             for uid, link in top_news:
                 if uid in visited:
@@ -145,6 +147,11 @@ async def main(page_limit, repeat_interval, download_dir, dry_run):
                     visited.add(result.uid)
 
             logging.info('Total visited pages %s' % len(visited))
+
+            if limit < page_limit:
+                limit += 3
+            else:
+                limit = page_limit
 
             await asyncio.sleep(repeat_interval)
 
