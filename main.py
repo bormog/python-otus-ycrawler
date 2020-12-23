@@ -108,6 +108,7 @@ async def process_page(session, uid, link, save_to_dir, dry_run=False):
                     dry_run=dry_run
                 ))
                 link_tasks.append(task)
+                await asyncio.sleep(0)
 
             await asyncio.gather(*link_tasks, return_exceptions=False)
     return download_result
@@ -132,6 +133,7 @@ async def main(page_limit, repeat_interval, download_dir, dry_run):
                 save_to_dir = os.path.join(download_dir, uid)
                 task = asyncio.create_task(process_page(session, uid, link, save_to_dir=save_to_dir, dry_run=dry_run))
                 tasks.append(task)
+                await asyncio.sleep(0)
             logging.info('Found %s new pages' % len(tasks))
 
             results = await asyncio.gather(*tasks, return_exceptions=False)
