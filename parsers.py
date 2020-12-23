@@ -19,7 +19,6 @@ def parse_top_news(html, limit):
 
 
 def parse_comments(html):
-    # todo may be in possible span.commtext > a
     soup = BeautifulSoup(html, 'html.parser')
     for span in soup.find_all('span', class_='commtext'):
         for a in span.find_all('a'):

@@ -2,7 +2,9 @@ import asyncio
 import logging
 import os
 import sys
-import time
+import uuid
+from collections import namedtuple
+from mimetypes import guess_extension
 
 import aiofiles
 import aiohttp
@@ -15,9 +17,34 @@ PAGE_LIMIT = 30
 DOWNLOAD_DIR = 'pages'
 REPEAT_INTERVAL = 5
 
-DRY_RUN = True
+DRY_RUN = False
 
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = 15
+
+FetchResult = namedtuple('FetchResult',
+                         ['status', 'content', 'encoding', 'ext', 'link', 'params'])
+DownloadResult = namedtuple('DownloadResult', ['uid', 'filepath', 'success'])
+
+
+# class Page:
+#
+#     def __init__(self, uid, parent_uid=None, status=None, ext=None, content=None, link=None, params=None,
+#                  save_to=None, filepath=None):
+#         self.uid = uid
+#         self.parent_uid = None
+#         self.status = status
+#         self.ext = ext
+#         self.content = content
+#         self.link = link
+#         self.save_to = None
+#         self.filepath = None
+#         self.attempt = 0
+#
+#     async def fetch(self, session):
+#         pass
+#
+#     async def save(self):
+#         pass
 
 
 async def fetch_page(session, link, params=None):
@@ -28,107 +55,116 @@ async def fetch_page(session, link, params=None):
                                timeout=REQUEST_TIMEOUT,
                                allow_redirects=True,
                                max_redirects=10,
-                               raise_for_status=True) as response:
-            # todo fix UnicodeDecodeError if pdf file is fetched
-            # example: https://www.cs.tufts.edu/~nr/cs257/archive/alfred-spector/spector85cirrus.pdf
+                               raise_for_status=True,
+                               ssl=False) as response:
+
+            content_type = response.headers['Content-Type']
+            ext = guess_extension(content_type.partition(';')[0].strip())
+
             try:
-                return await response.text()
-            except Exception as e:
+                if content_type == 'application/pdf':
+                    content = await response.read()
+                else:
+                    content = await response.text()
+
+                result = FetchResult(link=link, params=params, status=response.status,
+                                     encoding=response.get_encoding(), ext=ext, content=content)
+                return result
+            except UnicodeDecodeError:
+                logging.exception(response.headers)
+            except Exception:
                 logging.exception('Unknown exception while fetching link %s' % link)
+
     except asyncio.TimeoutError:
         logging.exception('Timeout while fetching link %s' % link)
+    except aiohttp.InvalidURL:
+        logging.exception('Invalid url %s with params %s' % (link, params))
     except aiohttp.ClientResponseError as e:
-        logging.error('ClientResponseError with status %s' % str(e))
+        logging.exception('ClientResponseError with status %s' % str(e))
+    except aiohttp.ClientOSError as e:
+        logging.exception('ClientOSError %s' % str(e))
+
+    return FetchResult(link=link, params=params, status=None, encoding=None, ext=None, content=None)
 
 
-async def save_page(filepath, content):
+async def download_page(filepath, content):
     if not DRY_RUN:
-        async with aiofiles.open(filepath, mode='w') as fw:
+        mode = 'wb' if isinstance(content, bytes) else 'w'
+        async with aiofiles.open(filepath, mode=mode) as fw:
             await fw.write(content)
             await fw.close()
 
 
-async def download_comment_link(session, link, dst_dir):
-    comment_link_content = await fetch_page(session, link)
-    if not comment_link_content:
-        return link, None
+async def fetch_and_download(session, uid, link, save_to_dir, params=None):
+    fetch_result = await fetch_page(session, link, params)
+    if not fetch_result.content:
+        return DownloadResult(uid=uid, filepath=None, success=False)
+    else:
+        filepath = os.path.join(save_to_dir, '%s%s' % (uid, fetch_result.ext))
+        if not DRY_RUN:
+            if not os.path.exists(save_to_dir):
+                os.makedirs(save_to_dir, exist_ok=True)
+            await download_page(filepath, fetch_result.content)
+        return DownloadResult(uid=uid, filepath=filepath, success=True)
 
-    filename = str(int(1000 * time.time()))
-    filepath = os.path.join(dst_dir, '%s.html' % filename)
-    await save_page(filepath, comment_link_content)
-    return link, filepath
 
-
-async def download_page(session, uid, link, dst_dir):
-    logging.info('[uid = %s] Download page %s' % (uid, link))
-    page_content = await fetch_page(session, link)
-    if not page_content:
-        return uid, None
-
-    logging.debug('[uid = %s] Save page %s' % (uid, link))
-    save_to_dir = os.path.join(dst_dir, uid)
-    if not os.path.exists(save_to_dir):
-        os.mkdir(save_to_dir)
-    filepath = os.path.join(save_to_dir, '%s.html' % uid)
-    await save_page(filepath, page_content)
+async def process_page(session, uid, link, save_to_dir):
+    logging.debug('[uid = %s] Download page %s' % (uid, link))
+    download_result = await fetch_and_download(session, uid, link, save_to_dir)
+    logging.debug('[uid = %s] Download result: %s' % (uid, download_result.success))
 
     logging.debug('[uid = %s] Download page comments' % uid)
-    comments_page = await fetch_page(session, COMMENT_PAGE_URL, params={'id': uid})
-    comments_links = parse_comments(comments_page)
+    fetch_results = await fetch_page(session, COMMENT_PAGE_URL, params={'id': uid})
+    if fetch_results.content:
+        comments_links = parse_comments(fetch_results.content)
+        if comments_links:
+            link_tasks = []
+            for link in comments_links:
+                link_save_to_dir = os.path.join(save_to_dir, 'links')
+                link_uid = uuid.uuid4().hex
+                task = asyncio.create_task(fetch_and_download(
+                    session,
+                    link_uid,
+                    link,
+                    save_to_dir=link_save_to_dir
+                ))
+                link_tasks.append(task)
 
-    if comments_links:
-        links_dir = os.path.join(save_to_dir, 'links')
-        if not os.path.exists(links_dir):
-            os.mkdir(links_dir)
-
-        tasks = []
-        for link in comments_links:
-            task = asyncio.create_task(download_comment_link(session, link, dst_dir=links_dir))
-            tasks.append(task)
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        logging.debug('comments results %s' % str(results))
-
-    return uid, filepath
+            await asyncio.gather(*link_tasks, return_exceptions=False)
+    return download_result
 
 
 async def main():
-    # todo ? do we need download new comments in old pages ?
-    # todo wtf Request.raise_for_status ?
-
-    # todo ? do we need use one session instead many?
     # todo argparse or optparse.
-    # todo make file extension by content-type
-
-    # todo wrap response in Response class OR return original response
     # todo ? do we need use class based code instead functional ?
     logging.info('Run script')
-    limit = 5
+    limit = 3
     visited = set()
     async with aiohttp.ClientSession() as session:
         while True:
             logging.info('Start fetch main page')
-            main_page_content = await fetch_page(session, MAIN_PAGE_URL)
-            if not main_page_content:
+            fetch_result = await fetch_page(session, MAIN_PAGE_URL)
+            if not fetch_result.content:
                 logging.error('Main content is empty. Continue')
                 continue
 
-            top_news = parse_top_news(main_page_content, limit=limit)
-
+            top_news = parse_top_news(fetch_result.content, limit=limit)
             tasks = []
             for uid, link in top_news:
                 if uid in visited:
                     continue
-                task = asyncio.create_task(download_page(session, uid, link, dst_dir=DOWNLOAD_DIR))
+                save_to_dir = os.path.join(DOWNLOAD_DIR, uid)
+                task = asyncio.create_task(process_page(session, uid, link, save_to_dir=save_to_dir))
                 tasks.append(task)
             logging.info('Found %s new pages' % len(tasks))
 
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            # todo check if not error in results
+            results = await asyncio.gather(*tasks, return_exceptions=False)
             for result in results:
                 if isinstance(result, Exception):
-                    logging.exception('Some exception: %s' % str(result))
-                else:
-                    visited.add(uid)
+                    logging.exception('Some unhandled exception: %s' % str(result))
+                elif isinstance(result, DownloadResult):
+                    visited.add(result.uid)
+
             logging.info('Total visited pages %s' % len(visited))
 
             await asyncio.sleep(REPEAT_INTERVAL)
@@ -151,5 +187,9 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         msg = 'Script has been stopped'
+        logging.info(msg)
+        sys.exit(msg)
+    except Exception:
+        msg = 'Something went wrong'
         logging.info(msg)
         sys.exit(msg)
