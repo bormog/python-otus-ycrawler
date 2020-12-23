@@ -148,6 +148,7 @@ async def main(page_limit, repeat_interval, download_dir, dry_run):
 
             logging.info('Total visited pages %s' % len(visited))
 
+            # Slowly increase limit to avoid zerg rush
             if limit < page_limit:
                 limit += 3
             else:
