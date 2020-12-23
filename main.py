@@ -63,7 +63,7 @@ async def fetch_page(session, link, params=None):
         logging.error('ClientResponseError with status %s, message %s, link %s and params %s' % (
         e.status, e.message, link, params))
     except aiohttp.ClientOSError as e:
-        logging.exception('ClientOSError: %s' % str(e))
+        logging.exception('ClientOSError link %s and params %s' % (link, params))
 
     return FetchResult(link=link, params=params, status=None, encoding=None, ext=None, content=None)
 
@@ -148,13 +148,17 @@ async def main(page_limit, repeat_interval, download_dir, dry_run):
 
             logging.info('Total visited pages %s' % len(visited))
 
-            # Slowly increase limit to avoid zerg rush
+            # Slowly increase limit and sleep to avoid zerg rush
             if limit < page_limit:
                 limit += 3
-            else:
+                sleep = 3
+            elif limit != page_limit:
                 limit = page_limit
+                sleep = repeat_interval
 
-            await asyncio.sleep(repeat_interval)
+            await asyncio.sleep(sleep)
+
+            # await asyncio.sleep(repeat_interval)
 
 
 if __name__ == '__main__':
