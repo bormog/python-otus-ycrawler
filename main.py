@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import logging
 import os
@@ -13,38 +14,16 @@ from parsers import parse_top_news, parse_comments
 
 MAIN_PAGE_URL = 'https://news.ycombinator.com'
 COMMENT_PAGE_URL = 'https://news.ycombinator.com/item'
+ALLOWED_FILE_CONTENT_TYPES = ['application/pdf', 'image/png']
+REQUEST_TIMEOUT = 30
+
 PAGE_LIMIT = 30
-DOWNLOAD_DIR = 'pages'
-REPEAT_INTERVAL = 5
-
+REPEAT_INTERVAL = 15
 DRY_RUN = False
+DOWNLOAD_DIR = 'pages'
 
-REQUEST_TIMEOUT = 15
-
-FetchResult = namedtuple('FetchResult',
-                         ['status', 'content', 'encoding', 'ext', 'link', 'params'])
+FetchResult = namedtuple('FetchResult', ['status', 'content', 'encoding', 'ext', 'link', 'params'])
 DownloadResult = namedtuple('DownloadResult', ['uid', 'filepath', 'success'])
-
-
-# class Page:
-#
-#     def __init__(self, uid, parent_uid=None, status=None, ext=None, content=None, link=None, params=None,
-#                  save_to=None, filepath=None):
-#         self.uid = uid
-#         self.parent_uid = None
-#         self.status = status
-#         self.ext = ext
-#         self.content = content
-#         self.link = link
-#         self.save_to = None
-#         self.filepath = None
-#         self.attempt = 0
-#
-#     async def fetch(self, session):
-#         pass
-#
-#     async def save(self):
-#         pass
 
 
 async def fetch_page(session, link, params=None):
@@ -62,7 +41,7 @@ async def fetch_page(session, link, params=None):
             ext = guess_extension(content_type.partition(';')[0].strip())
 
             try:
-                if content_type == 'application/pdf':
+                if content_type in ALLOWED_FILE_CONTENT_TYPES:
                     content = await response.read()
                 else:
                     content = await response.text()
@@ -71,7 +50,7 @@ async def fetch_page(session, link, params=None):
                                      encoding=response.get_encoding(), ext=ext, content=content)
                 return result
             except UnicodeDecodeError:
-                logging.exception(response.headers)
+                logging.exception('Failed fetch link %s, headers = ', (link, response.headers))
             except Exception:
                 logging.exception('Unknown exception while fetching link %s' % link)
 
@@ -88,29 +67,28 @@ async def fetch_page(session, link, params=None):
 
 
 async def download_page(filepath, content):
-    if not DRY_RUN:
-        mode = 'wb' if isinstance(content, bytes) else 'w'
-        async with aiofiles.open(filepath, mode=mode) as fw:
-            await fw.write(content)
-            await fw.close()
+    mode = 'wb' if isinstance(content, bytes) else 'w'
+    async with aiofiles.open(filepath, mode=mode) as fw:
+        await fw.write(content)
+        await fw.close()
 
 
-async def fetch_and_download(session, uid, link, save_to_dir, params=None):
+async def fetch_and_download(session, uid, link, save_to_dir, params=None, dry_run=False):
     fetch_result = await fetch_page(session, link, params)
     if not fetch_result.content:
         return DownloadResult(uid=uid, filepath=None, success=False)
     else:
         filepath = os.path.join(save_to_dir, '%s%s' % (uid, fetch_result.ext))
-        if not DRY_RUN:
+        if not dry_run:
             if not os.path.exists(save_to_dir):
                 os.makedirs(save_to_dir, exist_ok=True)
             await download_page(filepath, fetch_result.content)
         return DownloadResult(uid=uid, filepath=filepath, success=True)
 
 
-async def process_page(session, uid, link, save_to_dir):
+async def process_page(session, uid, link, save_to_dir, dry_run=False):
     logging.debug('[uid = %s] Download page %s' % (uid, link))
-    download_result = await fetch_and_download(session, uid, link, save_to_dir)
+    download_result = await fetch_and_download(session, uid, link, save_to_dir, dry_run=dry_run)
     logging.debug('[uid = %s] Download result: %s' % (uid, download_result.success))
 
     logging.debug('[uid = %s] Download page comments' % uid)
@@ -126,7 +104,8 @@ async def process_page(session, uid, link, save_to_dir):
                     session,
                     link_uid,
                     link,
-                    save_to_dir=link_save_to_dir
+                    save_to_dir=link_save_to_dir,
+                    dry_run=dry_run
                 ))
                 link_tasks.append(task)
 
@@ -134,11 +113,8 @@ async def process_page(session, uid, link, save_to_dir):
     return download_result
 
 
-async def main():
-    # todo argparse or optparse.
-    # todo ? do we need use class based code instead functional ?
+async def main(page_limit, repeat_interval, download_dir, dry_run):
     logging.info('Run script')
-    limit = 3
     visited = set()
     async with aiohttp.ClientSession() as session:
         while True:
@@ -148,13 +124,13 @@ async def main():
                 logging.error('Main content is empty. Continue')
                 continue
 
-            top_news = parse_top_news(fetch_result.content, limit=limit)
+            top_news = parse_top_news(fetch_result.content, limit=page_limit)
             tasks = []
             for uid, link in top_news:
                 if uid in visited:
                     continue
-                save_to_dir = os.path.join(DOWNLOAD_DIR, uid)
-                task = asyncio.create_task(process_page(session, uid, link, save_to_dir=save_to_dir))
+                save_to_dir = os.path.join(download_dir, uid)
+                task = asyncio.create_task(process_page(session, uid, link, save_to_dir=save_to_dir, dry_run=dry_run))
                 tasks.append(task)
             logging.info('Found %s new pages' % len(tasks))
 
@@ -167,29 +143,39 @@ async def main():
 
             logging.info('Total visited pages %s' % len(visited))
 
-            await asyncio.sleep(REPEAT_INTERVAL)
-
-            if limit < PAGE_LIMIT:
-                limit += 1
+            await asyncio.sleep(repeat_interval)
 
 
 if __name__ == '__main__':
+    arg_parser = argparse.ArgumentParser(description='Crawler for https://news.ycombinator.com')
+    arg_parser.add_argument('--repeat_interval', default=REPEAT_INTERVAL, type=int)
+    arg_parser.add_argument('--page_limit', default=PAGE_LIMIT, type=int)
+    arg_parser.add_argument('--download_dir', default=DOWNLOAD_DIR, type=str)
+    arg_parser.add_argument('--dry_run', default=True, type=bool)
+    arg_parser.add_argument('--logfile', default=None)
+    arg_parser.add_argument('--loglevel', default='INFO', type=str)
+
+    args = arg_parser.parse_args()
+
     logging.basicConfig(
         format='[%(asctime)s] %(levelname).1s %(message)s',
         datefmt='%Y.%m.%d %H:%M:%S',
-        filename=None,
-        level=logging.INFO
+        filename=args.logfile,
+        level=getattr(logging, args.loglevel)
     )
-    if not os.path.exists(DOWNLOAD_DIR):
-        os.mkdir(DOWNLOAD_DIR)
+    if not os.path.exists(args.download_dir):
+        os.mkdir(args.download_dir)
 
     try:
-        asyncio.run(main())
+        asyncio.run(main(page_limit=args.page_limit,
+                         repeat_interval=args.repeat_interval,
+                         download_dir=args.download_dir,
+                         dry_run=args.dry_run))
     except KeyboardInterrupt:
         msg = 'Script has been stopped'
         logging.info(msg)
         sys.exit(msg)
-    except Exception:
-        msg = 'Something went wrong'
+    except Exception as e:
+        msg = 'Something went wrong %s' % str(e)
         logging.info(msg)
         sys.exit(msg)
