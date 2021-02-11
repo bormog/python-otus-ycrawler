@@ -1,22 +1,25 @@
 import argparse
 import asyncio
+import functools
 import logging
 import os
 import sys
 import uuid
-import aiohttp
-import functools
 
-from parsers import parse_top_news, parse_comments
+import aiohttp
+
 from fetcher import URLFetcher, DownloadResult
+from parsers import parse_top_news, parse_comments
 
 MAIN_PAGE_URL = 'https://news.ycombinator.com'
 COMMENT_PAGE_URL = 'https://news.ycombinator.com/item'
 
 PAGE_LIMIT = 30
 REPEAT_INTERVAL = 15
-DRY_RUN = False
+DRY_RUN = True
 DOWNLOAD_DIR = 'pages'
+
+CONN_LIMIT_PER_HOST = 60
 
 
 class YCrawler:
@@ -98,7 +101,8 @@ class YCrawler:
 
     async def run(self):
         loop_number = 0
-        async with aiohttp.ClientSession() as session:
+        connector = aiohttp.TCPConnector(limit_per_host=CONN_LIMIT_PER_HOST)
+        async with aiohttp.ClientSession(connector=connector) as session:
             while True:
                 logging.info("[Loop = %d]. Iteration start" % loop_number)
 
@@ -116,7 +120,7 @@ if __name__ == '__main__':
     arg_parser.add_argument('--repeat_interval', default=REPEAT_INTERVAL, type=int)
     arg_parser.add_argument('--page_limit', default=PAGE_LIMIT, type=int)
     arg_parser.add_argument('--download_dir', default=DOWNLOAD_DIR, type=str)
-    arg_parser.add_argument('--dry_run', default=True, type=bool)
+    arg_parser.add_argument('--dry_run', default=DRY_RUN, type=bool)
     arg_parser.add_argument('--logfile', default=None)
     arg_parser.add_argument('--loglevel', default='INFO', type=str)
 
