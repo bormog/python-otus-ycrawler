@@ -4,162 +4,111 @@ import logging
 import os
 import sys
 import uuid
-from collections import namedtuple
-from mimetypes import guess_extension
-
-import aiofiles
 import aiohttp
-import async_timeout
+import functools
 
 from parsers import parse_top_news, parse_comments
+from fetcher import URLFetcher, DownloadResult
 
 MAIN_PAGE_URL = 'https://news.ycombinator.com'
 COMMENT_PAGE_URL = 'https://news.ycombinator.com/item'
-ALLOWED_FILE_CONTENT_TYPES = ['application/pdf', 'image/png']
-REQUEST_TIMEOUT = 30
-
-INITIAL_LIMIT = 3
-INITIAL_INTERVAL = 2
 
 PAGE_LIMIT = 30
 REPEAT_INTERVAL = 15
 DRY_RUN = False
 DOWNLOAD_DIR = 'pages'
 
-FetchResult = namedtuple('FetchResult', ['status', 'content', 'encoding', 'ext', 'link', 'params'])
-DownloadResult = namedtuple('DownloadResult', ['uid', 'filepath', 'success'])
 
+class YCrawler:
 
-async def fetch_page(session, link, params=None):
-    params = params or {}
-    logging.debug('Fetch page %s with params %s' % (link, str(params)))
-    try:
-        async with session.get(link, params=params,
-                               timeout=REQUEST_TIMEOUT,
-                               allow_redirects=True,
-                               max_redirects=10,
-                               raise_for_status=True,
-                               ssl=False) as response:
+    def __init__(self, limit, repeat_interval, download_dir, dry_run):
+        self.limit = limit
+        self.repeat_interval = repeat_interval
+        self.download_dir = download_dir
+        self.dry_run = dry_run
 
-            content_type = response.headers['Content-Type']
-            ext = guess_extension(content_type.partition(';')[0].strip())
+        self.scheduled = set()
+        self.visited = set()
 
-            try:
-                if content_type in ALLOWED_FILE_CONTENT_TYPES:
-                    content = await response.read()
-                else:
-                    content = await response.text()
+    async def process_page(self, fetcher, session, uid, link, save_to_dir):
+        logging.debug('[uid = %s] Download page %s' % (uid, link))
+        download_result = await fetcher.fetch_and_download(session, uid, link, save_to_dir, dry_run=self.dry_run)
+        logging.debug('[uid = %s] Download result: %s' % (uid, download_result.success))
 
-                result = FetchResult(link=link, params=params, status=response.status,
-                                     encoding=response.get_encoding(), ext=ext, content=content)
-                return result
-            except UnicodeDecodeError:
-                logging.exception('Failed fetch link %s, headers = ', (link, response.headers))
-            except Exception:
-                logging.exception('Unknown exception while fetching link %s' % link)
+        logging.debug('[uid = %s] Download page comments' % uid)
+        fetch_results = await fetcher.fetch_page(session, COMMENT_PAGE_URL, params={'id': uid})
+        if fetch_results.content:
+            comments_links = parse_comments(fetch_results.content)
+            if comments_links:
+                link_tasks = []
+                for link in comments_links:
+                    link_save_to_dir = os.path.join(save_to_dir, 'links')
+                    link_uid = uuid.uuid4().hex
+                    task = asyncio.create_task(fetcher.fetch_and_download(
+                        session,
+                        link_uid,
+                        link,
+                        save_to_dir=link_save_to_dir,
+                        dry_run=self.dry_run
+                    ))
+                    link_tasks.append(task)
+                    await asyncio.sleep(0)
 
-    except asyncio.TimeoutError:
-        logging.info('Timeout while fetching link %s and params %s' % (link, params))
-    except aiohttp.InvalidURL:
-        logging.exception('Invalid url %s with params %s' % (link, params))
-    except aiohttp.ClientResponseError as e:
-        logging.error('ClientResponseError with status %s, message %s, link %s and params %s' % (
-        e.status, e.message, link, params))
-    except aiohttp.ClientOSError as e:
-        logging.exception('ClientOSError link %s and params %s' % (link, params))
+                await asyncio.gather(*link_tasks, return_exceptions=False)
+        return download_result
 
-    return FetchResult(link=link, params=params, status=None, encoding=None, ext=None, content=None)
+    async def process_main_page(self, session, loop_number):
+        fetcher = URLFetcher()
+        fetch_result = await fetcher.fetch_page(session, MAIN_PAGE_URL)
+        if not fetch_result.content:
+            logging.error('[Loop = %d]. Main content is empty' % loop_number)
+            return
 
-
-async def download_page(filepath, content):
-    mode = 'wb' if isinstance(content, bytes) else 'w'
-    async with aiofiles.open(filepath, mode=mode) as fw:
-        await fw.write(content)
-        await fw.close()
-
-
-async def fetch_and_download(session, uid, link, save_to_dir, params=None, dry_run=False):
-    fetch_result = await fetch_page(session, link, params)
-    if not fetch_result.content:
-        return DownloadResult(uid=uid, filepath=None, success=False)
-    else:
-        filepath = os.path.join(save_to_dir, '%s%s' % (uid, fetch_result.ext))
-        if not dry_run:
-            if not os.path.exists(save_to_dir):
-                os.makedirs(save_to_dir, exist_ok=True)
-            await download_page(filepath, fetch_result.content)
-        return DownloadResult(uid=uid, filepath=filepath, success=True)
-
-
-async def process_page(session, uid, link, save_to_dir, dry_run=False):
-    logging.debug('[uid = %s] Download page %s' % (uid, link))
-    download_result = await fetch_and_download(session, uid, link, save_to_dir, dry_run=dry_run)
-    logging.debug('[uid = %s] Download result: %s' % (uid, download_result.success))
-
-    logging.debug('[uid = %s] Download page comments' % uid)
-    fetch_results = await fetch_page(session, COMMENT_PAGE_URL, params={'id': uid})
-    if fetch_results.content:
-        comments_links = parse_comments(fetch_results.content)
-        if comments_links:
-            link_tasks = []
-            for link in comments_links:
-                link_save_to_dir = os.path.join(save_to_dir, 'links')
-                link_uid = uuid.uuid4().hex
-                task = asyncio.create_task(fetch_and_download(
-                    session,
-                    link_uid,
-                    link,
-                    save_to_dir=link_save_to_dir,
-                    dry_run=dry_run
-                ))
-                link_tasks.append(task)
-                await asyncio.sleep(0)
-
-            await asyncio.gather(*link_tasks, return_exceptions=False)
-    return download_result
-
-
-async def main(page_limit, repeat_interval, download_dir, dry_run):
-    logging.info('Run script')
-    visited = set()
-    limit = INITIAL_LIMIT
-    async with aiohttp.ClientSession() as session:
-        while True:
-            logging.info('Start fetch main page')
-            fetch_result = await fetch_page(session, MAIN_PAGE_URL)
-            if not fetch_result.content:
-                logging.error('Main content is empty. Continue')
+        top_news = parse_top_news(fetch_result.content, limit=self.limit)
+        tasks = []
+        for uid, link in top_news:
+            if uid in self.scheduled or uid in self.visited:
                 continue
+            save_to_dir = os.path.join(self.download_dir, uid)
+            task = asyncio.create_task(self.process_page(fetcher, session, uid, link, save_to_dir=save_to_dir))
+            self.scheduled.add(uid)
+            tasks.append(task)
+        logging.info('[Loop = %d]. Scheduled %s new tasks' % (loop_number, len(tasks)))
 
-            top_news = parse_top_news(fetch_result.content, limit=limit)
-            tasks = []
-            for uid, link in top_news:
-                if uid in visited:
-                    continue
-                save_to_dir = os.path.join(download_dir, uid)
-                task = asyncio.create_task(process_page(session, uid, link, save_to_dir=save_to_dir, dry_run=dry_run))
-                tasks.append(task)
-                await asyncio.sleep(0)
-            logging.info('Found %s new pages' % len(tasks))
+        if not tasks:
+            return
 
-            results = await asyncio.gather(*tasks, return_exceptions=False)
-            for result in results:
-                if isinstance(result, Exception):
-                    logging.exception('Some unhandled exception: %s' % str(result))
-                elif isinstance(result, DownloadResult):
-                    visited.add(result.uid)
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        logging.info("[Loop = %d]. Fetcher Results: fetched %d, downloads %d, errors %s" %
+                     (loop_number, fetcher.fetched, fetcher.download, fetcher.errors))
+        return results
 
-            logging.info('Total visited pages %s' % len(visited))
+    def after_main_page_processed(self, task, loop_number):
+        results = task.result()
+        if not results:
+            return
+        for result in results:
+            if isinstance(result, Exception):
+                logging.exception('Some unhandled exception: %s' % str(result))
+            elif isinstance(result, DownloadResult):
+                self.visited.add(result.uid)
+                self.scheduled.remove(result.uid)
+        logging.info('[Loop = %d]. Scheduled %d pages, visited %d pages' %
+                     (loop_number, len(self.scheduled), len(self.visited)))
 
-            # Slowly increase limit and sleep to avoid zerg rush
-            if limit < page_limit:
-                limit += INITIAL_LIMIT
-                sleep = INITIAL_INTERVAL
-            elif limit != page_limit:
-                limit = page_limit
-                sleep = repeat_interval
+    async def run(self):
+        loop_number = 0
+        async with aiohttp.ClientSession() as session:
+            while True:
+                logging.info("[Loop = %d]. Iteration start" % loop_number)
 
-            await asyncio.sleep(sleep)
+                task = asyncio.create_task(self.process_main_page(session, loop_number))
+                task.add_done_callback(functools.partial(self.after_main_page_processed, loop_number=loop_number))
+
+                logging.info("[Loop = %d]. Iteration end. Sleep now on %d sec" % (loop_number, self.repeat_interval))
+
+                loop_number += 1
+                await asyncio.sleep(self.repeat_interval)
 
 
 if __name__ == '__main__':
@@ -183,15 +132,16 @@ if __name__ == '__main__':
         os.mkdir(args.download_dir)
 
     try:
-        asyncio.run(main(page_limit=args.page_limit,
-                         repeat_interval=args.repeat_interval,
-                         download_dir=args.download_dir,
-                         dry_run=args.dry_run))
+        crawler = YCrawler(limit=args.page_limit,
+                           repeat_interval=args.repeat_interval,
+                           download_dir=args.download_dir,
+                           dry_run=args.dry_run)
+        asyncio.run(crawler.run())
     except KeyboardInterrupt:
         msg = 'Script has been stopped'
         logging.info(msg)
         sys.exit(msg)
     except Exception as e:
         msg = 'Something went wrong %s' % str(e)
-        logging.info(msg)
+        logging.error(msg)
         sys.exit(msg)
